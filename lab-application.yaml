@@ -1,0 +1,555 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  Application Template (SEIS615 cafe): recreates the scalable cafe on top of the
+  network stack. Internet -> internet-facing ALB (public subnets) -> Auto Scaling
+  group of cafe web instances (private subnets) -> Multi-AZ RDS MariaDB (private).
+  A bastion in a public subnet provides SSH from the deployer workstation only.
+  Rebuilt from the prior Elasticity & Availability deployment.
+
+# CHANGED FROM CLASS ORIGINAL (baseline/lab-application.yaml.orig):
+#   The class original launched ONE Amazon Linux 2 EC2 running httpd with a 100 GB
+#   EBS volume (Snapshot deletion policy) and a security group open on port 80 to
+#   0.0.0.0/0. None of that models the cafe, so it is replaced:
+#     REMOVED  WebServerInstance (single demo EC2 + cfn-init httpd page)
+#              -> replaced by a Launch Template + Auto Scaling group of cafe app
+#                 instances in the private subnets.
+#     REMOVED  DiskVolume / DiskMountPoint (100 GB EBS, DeletionPolicy: Snapshot)
+#              -> the cafe keeps no local state (data lives in RDS); carrying a
+#                 Snapshot-retained volume would leave orphaned snapshots, so it is
+#                 dropped per the assignment note.
+#     REMOVED  WebServerSecurityGroup (port 80 from 0.0.0.0/0 on the instance)
+#              -> replaced by a chain: ALB SG (80 from internet) -> App SG (80 from
+#                 ALB only) -> RDS SG (3306 from App + bastion only) + Bastion SG
+#                 (22 from the workstation /32 only).
+#     ADDED    ALB + target group + listener, Launch Template, Auto Scaling group +
+#              CPU target-tracking policy, bastion host, Multi-AZ RDS MariaDB,
+#              DB subnet group, and parameters for workstation CIDR, ASG min/max,
+#              key pair, instance profile, and RDS master credentials.
+#
+# DISCREPANCY RECORDED: the prior Elasticity build used SSM Session Manager for all
+# private shell/DB access and had NO SSH and NO bastion. This assignment explicitly
+# requires a bastion with SSH from the workstation /32, so a bastion is ADDED here.
+# The instance role still includes SSM, so both access paths exist.
+#
+# Source of settings: prior Elasticity HANDOFF.md, deploy-stage2-app.sh,
+# cafe-userdata.sh, evidence/verify/12-verification.txt, and
+# evidence/admin-setup/seis615-elasticity-cafe-role.json.
+
+######################
+# Parameters section
+######################
+
+Parameters:
+
+  # PRESERVED CONTRACT from the class original: name of the network stack whose
+  # exports (VPC + subnets) this stack imports. Must match the deployed net stack.
+  NetworkStackName:
+    Description: >-
+      Name of the active network CloudFormation stack that exports the VPC and
+      subnet IDs consumed here.
+    Type: String
+    MinLength: 1
+    MaxLength: 255
+    AllowedPattern: '^[a-zA-Z][-a-zA-Z0-9]*$'
+    Default: lab-network
+
+  # PRESERVED from the class original: resolves the latest Amazon Linux 2023 AMI
+  # from the public SSM parameter at deploy time (no hard-coded AMI ID). CHANGED
+  # from the demo's amzn2 (AL2) default to AL2023 to match the prior cafe build;
+  # the bootstrap uses dnf and the AL2023 curl-minimal fix.
+  AmazonLinuxAMIID:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+  # NEW (required by the assignment): the deployer workstation public IPv4 as a
+  # /32 so the bastion accepts SSH from that single address only. AllowedPattern
+  # enforces a single host with /32 (rejects broader ranges like /24 or 0.0.0.0/0).
+  WorkstationCidr:
+    Description: >-
+      Your Mac's current public IPv4 as a single-host CIDR (must end in /32).
+      Find it at deploy time with: curl -s https://checkip.amazonaws.com
+    Type: String
+    AllowedPattern: '^((25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(25[0-5]|2[0-4]\d|1?\d?\d)/32$'
+    ConstraintDescription: Must be a single IPv4 address in CIDR form ending with /32.
+
+  # NEW (required): numeric Auto Scaling bounds wired straight to MinSize/MaxSize.
+  # Defaults match the prior build (min 2, max 3).
+  AsgMinSize:
+    Description: Auto Scaling group minimum size (prior build used 2).
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+
+  AsgMaxSize:
+    Description: Auto Scaling group maximum size (prior build used 3). Must be >= min and >= desired.
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 10
+
+  AsgDesiredCapacity:
+    Description: >-
+      Auto Scaling group desired capacity (prior build used 2). Keep
+      min <= desired <= max; this is validated at deploy time in the inputs.
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+
+  # NEW: EC2 key pair for bastion (and optional app) SSH. The key pair must
+  # already exist in the Region; the private key stays on the Mac (never in source).
+  KeyPairName:
+    Description: Name of an existing EC2 key pair for bastion SSH access.
+    Type: AWS::EC2::KeyPair::KeyName
+
+  # NEW: name of an existing IAM instance profile for the app instances. Defaults
+  # to the prior admin-created least-privilege profile (reads only the 7 /cafe/*
+  # secrets + AmazonSSMManagedInstanceCore). CloudFormation references it by name;
+  # an admin must ensure it exists in the account (the lab build user cannot create
+  # IAM roles). See the chunk-1 summary for how to verify or recreate it.
+  AppInstanceProfileName:
+    Description: >-
+      Existing IAM instance profile name for the cafe app instances (least
+      privilege: read the seven /cafe/* secrets + SSM core).
+    Type: String
+    Default: seis615-elasticity-cafe-role
+
+  # NEW: bastion instance type (kept small; bastion only forwards SSH).
+  BastionInstanceType:
+    Description: Bastion EC2 instance type.
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small]
+
+  # NEW: app instance type. Prior build used t3.micro.
+  AppInstanceType:
+    Description: Cafe app EC2 instance type.
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small, t3.medium]
+
+  # NEW: RDS master credentials passed at deploy time. NoEcho keeps the password
+  # out of console/API output; it is NOT stored in source. The app itself does NOT
+  # use these — it reads a dedicated DML-only app user from Secrets Manager. These
+  # master creds are used only to seed the schema and create that app user.
+  DBMasterUsername:
+    Description: RDS MariaDB master username (used only for seeding, not by the app).
+    Type: String
+    Default: admin
+    MinLength: 1
+    MaxLength: 16
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9]*$'
+
+  DBMasterPassword:
+    Description: >-
+      RDS MariaDB master password (8-41 chars). NoEcho; never stored in source.
+      Generate a random value at deploy time and keep it out of evidence.
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 41
+
+  # NEW: RDS sizing, parameterized with prior-build defaults.
+  DBInstanceClass:
+    Description: RDS instance class (prior build used db.t3.micro).
+    Type: String
+    Default: db.t3.micro
+
+  DBAllocatedStorage:
+    Description: RDS allocated storage in GiB (prior build used 20).
+    Type: Number
+    Default: 20
+    MinValue: 20
+    MaxValue: 100
+
+######################
+# Resources section
+######################
+
+Resources:
+
+  ####################################################################
+  # SECURITY GROUPS  (chain: internet->ALB:80, ALB->app:80, app/bastion->RDS:3306,
+  # workstation/32->bastion:22, bastion->app:22). SSH audit: the ONLY 0.0.0.0/0
+  # ingress anywhere is ALB port 80 (public web, expected). No SG allows SSH from
+  # 0.0.0.0/0 — the demo/lab-application2 wide-open :22 rule is deliberately NOT
+  # copied.
+  ####################################################################
+
+  # ALB security group: the only internet-facing ingress (HTTP 80). This is the
+  # single intentional 0.0.0.0/0 rule in the stack (public website).
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB ingress HTTP 80 from the internet.
+      VpcId:
+        Fn::ImportValue: !Sub '${NetworkStackName}-VPCID'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: Public HTTP to the load balancer.
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-alb-sg'
+
+  # Bastion security group: SSH 22 from the workstation /32 ONLY (no 0.0.0.0/0).
+  BastionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Bastion ingress SSH 22 from the deployer workstation /32 only.
+      VpcId:
+        Fn::ImportValue: !Sub '${NetworkStackName}-VPCID'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref WorkstationCidr   # /32 enforced by the parameter pattern
+          Description: SSH from the deployer workstation only.
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-bastion-sg'
+
+  # App security group: HTTP 80 from the ALB SG only; SSH 22 from the bastion SG
+  # only. No public ingress; instances have no public IP.
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Cafe app ingress HTTP 80 from ALB and SSH 22 from bastion.
+      VpcId:
+        Fn::ImportValue: !Sub '${NetworkStackName}-VPCID'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-app-sg'
+
+  # Ingress rules referencing other SGs are defined as separate resources to avoid
+  # any ordering/circular-reference issues within a single SG definition.
+  AppIngressFromAlb:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref AppSecurityGroup
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      SourceSecurityGroupId: !Ref AlbSecurityGroup
+      Description: HTTP from the load balancer only.
+
+  AppIngressSshFromBastion:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref AppSecurityGroup
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      SourceSecurityGroupId: !Ref BastionSecurityGroup
+      Description: SSH to private app instances from the bastion only.
+
+  # RDS security group: MySQL/MariaDB 3306 from the app SG and from the bastion SG.
+  # The bastion is the authorized SEED host (runs the create-db.sql load), matching
+  # the assignment requirement to restrict DB traffic to app + authorized seed
+  # sources. Database stays private (not publicly accessible).
+  RdsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS ingress 3306 from the app and the seed bastion only.
+      VpcId:
+        Fn::ImportValue: !Sub '${NetworkStackName}-VPCID'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-rds-sg'
+
+  RdsIngressFromApp:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref RdsSecurityGroup
+      IpProtocol: tcp
+      FromPort: 3306
+      ToPort: 3306
+      SourceSecurityGroupId: !Ref AppSecurityGroup
+      Description: MariaDB from the cafe app instances.
+
+  RdsIngressFromBastion:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref RdsSecurityGroup
+      IpProtocol: tcp
+      FromPort: 3306
+      ToPort: 3306
+      SourceSecurityGroupId: !Ref BastionSecurityGroup
+      Description: MariaDB from the authorized seed host (bastion) only.
+
+  ####################################################################
+  # BASTION HOST (NEW) — public subnet AZ1, public IP, SSH from workstation /32.
+  # Provides SSH to private app instances and can seed the private RDS. Uses the
+  # same AL2023 AMI; a MariaDB client is installed so it can run the seed step.
+  ####################################################################
+  BastionInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref BastionInstanceType
+      ImageId: !Ref AmazonLinuxAMIID
+      KeyName: !Ref KeyPairName
+      NetworkInterfaces:
+        - DeviceIndex: 0
+          AssociatePublicIpAddress: true   # bastion needs a public IP for SSH
+          DeleteOnTermination: true
+          GroupSet:
+            - !Ref BastionSecurityGroup
+          SubnetId:
+            Fn::ImportValue: !Sub '${NetworkStackName}-PublicSubnet1'
+      UserData:
+        # No !Sub: this script has no CloudFormation variables to substitute.
+        Fn::Base64: |
+          #!/bin/bash -xe
+          # Install a MariaDB client so this host can seed the private RDS over 3306.
+          dnf install -y --allowerasing mariadb105 || dnf install -y --allowerasing mariadb || true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-bastion'
+
+  ####################################################################
+  # LAUNCH TEMPLATE (replaces the demo WebServerInstance). AL2023, t3.micro,
+  # no public IP, app SG, IMDSv2 required, instance profile for Secrets Manager +
+  # SSM. User-data reproduces the prior cafe bootstrap: install Apache/PHP, pull
+  # the pinned rclc/cafe-app (cafe.zip + aws.phar), apply the MariaDB TLS patch,
+  # and publish a static /health.php for the target group.
+  ####################################################################
+  AppLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${AWS::StackName}-cafe-lt'
+      # Tag the launch template itself to satisfy the lab IAM policy, which allows
+      # ec2:CreateLaunchTemplate only when the request carries the tag
+      # Project=seis615-cloudformation. (Instance-level tags remain in
+      # LaunchTemplateData.TagSpecifications below.)
+      TagSpecifications:
+        - ResourceType: launch-template
+          Tags:
+            - Key: Project
+              Value: seis615-cloudformation
+      LaunchTemplateData:
+        ImageId: !Ref AmazonLinuxAMIID
+        InstanceType: !Ref AppInstanceType
+        KeyName: !Ref KeyPairName            # allows bastion->app SSH if needed
+        IamInstanceProfile:
+          Name: !Ref AppInstanceProfileName  # existing least-privilege profile
+        MetadataOptions:
+          HttpTokens: required               # IMDSv2 only (matches prior build)
+          HttpEndpoint: enabled
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: false  # private instances, egress via NAT
+            Groups:
+              - !Ref AppSecurityGroup
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${AWS::StackName}-cafe-app'
+              # Instances must also carry Project: the lab IAM policy tag-conditions
+              # the ASG's RunInstances launch check on Project=seis615-cloudformation.
+              - Key: Project
+                Value: seis615-cloudformation
+        UserData:
+          # No !Sub: the bootstrap uses only shell variables, no CloudFormation
+          # substitutions, so plain Fn::Base64 avoids ${!...} escaping.
+          Fn::Base64: |
+            #!/bin/bash
+            # SEIS615 cafe bootstrap (from Elasticity/scripts/cafe-userdata.sh).
+            set -euxo pipefail
+            exec > >(tee /var/log/cafe-bootstrap.log) 2>&1
+            PIN="19661b5ac086f83191b33699a16c8c139910c6de"
+            BASE="https://raw.githubusercontent.com/rclc/cafe-app/${PIN}"
+            # AL2023: do NOT install 'curl' (conflicts with preinstalled curl-minimal
+            # and would abort under set -e). Skip 'dnf update' for the same reason.
+            dnf install -y --allowerasing httpd php php-fpm php-mysqlnd unzip tar gzip
+            dnf install -y stress-ng || dnf install -y stress || true
+            systemctl enable httpd php-fpm
+            work="$(mktemp -d)"
+            curl -fsSL --retry 5 --max-time 180 "${BASE}/cafe.zip" -o "${work}/cafe.zip"
+            curl -fsSL --retry 5 --max-time 300 "${BASE}/aws.phar" -o "${work}/aws.phar"
+            rm -rf /var/www/html/cafe
+            unzip -q "${work}/cafe.zip" -d /var/www/html/
+            # App require()s aws.phar (AWS PHP SDK) to read the /cafe/* secrets.
+            install -m 0644 "${work}/aws.phar" /var/www/html/cafe/aws.phar
+            # TLS patch: RDS mariadb11.8 default parameter group enforces
+            # require_secure_transport=ON, so rewrite the plaintext mysqli connects
+            # to use TLS (skip CA verify inside the private VPC).
+            for f in menu.php orderHistory.php processOrder.php; do
+              perl -0777 -pi -e 's/\$conn\s*=\s*new\s+mysqli\s*\(\s*\$db_url\s*,\s*\$db_user\s*,\s*\$db_password\s*,\s*\$db_name\s*\)\s*;/\$conn = mysqli_init(); \$conn->ssl_set(NULL,NULL,NULL,NULL,NULL); \@\$conn->real_connect(\$db_url, \$db_user, \$db_password, \$db_name, 3306, NULL, MYSQLI_CLIENT_SSL | MYSQLI_CLIENT_SSL_DONT_VERIFY_SERVER_CERT);/g' "/var/www/html/cafe/$f"
+            done
+            chmod -R a+rX /var/www/html/cafe
+            chown -R root:root /var/www/html/cafe
+            grep -q '^date.timezone' /etc/php.ini || sed -i '2i date.timezone = "America/New_York"' /etc/php.ini
+            # Static health page: target-group health != DB readiness, by design.
+            echo '<?php http_response_code(200); echo "ok"; ?>' > /var/www/html/health.php
+            systemctl restart php-fpm httpd
+            sleep 3
+            curl -fsS -o /dev/null -w 'health.php -> HTTP %{http_code}\n' http://127.0.0.1/health.php || true
+            curl -fsS -o /dev/null -w 'cafe/menu.php -> HTTP %{http_code}\n' http://127.0.0.1/cafe/menu.php || true
+
+  ####################################################################
+  # APPLICATION LOAD BALANCER across both public subnets + target group + listener.
+  # Health check /health.php, interval 15s, healthy threshold 2 (prior build).
+  ####################################################################
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${AWS::StackName}-cafe-alb'
+      Scheme: internet-facing
+      Type: application
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+      Subnets:
+        - Fn::ImportValue: !Sub '${NetworkStackName}-PublicSubnet1'
+        - Fn::ImportValue: !Sub '${NetworkStackName}-PublicSubnet2'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-cafe-alb'
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${AWS::StackName}-cafe-tg'
+      VpcId:
+        Fn::ImportValue: !Sub '${NetworkStackName}-VPCID'
+      Protocol: HTTP
+      Port: 80
+      TargetType: instance
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /health.php
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  ####################################################################
+  # AUTO SCALING GROUP across both private subnets, wired to the min/max/desired
+  # parameters, ELB health checks, 180s grace (prior build), plus a CPU target-
+  # tracking policy at 25% (policy seis615-cpu25 equivalent).
+  ####################################################################
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub '${AWS::StackName}-cafe-asg'
+      MinSize: !Ref AsgMinSize
+      MaxSize: !Ref AsgMaxSize
+      DesiredCapacity: !Ref AsgDesiredCapacity
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 180
+      VPCZoneIdentifier:
+        - Fn::ImportValue: !Sub '${NetworkStackName}-PrivateSubnet1'
+        - Fn::ImportValue: !Sub '${NetworkStackName}-PrivateSubnet2'
+      LaunchTemplate:
+        LaunchTemplateId: !Ref AppLaunchTemplate
+        Version: !GetAtt AppLaunchTemplate.LatestVersionNumber
+      TargetGroupARNs:
+        - !Ref TargetGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-cafe-app'
+          PropagateAtLaunch: true
+
+  CpuTargetTrackingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 25.0   # prior build scaled out at 25% average CPU
+
+  ####################################################################
+  # PRIVATE MULTI-AZ RDS MARIADB + DB subnet group across both private subnets.
+  # Not publicly accessible; master creds come from NoEcho parameters (not source).
+  ####################################################################
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Cafe private DB subnet group (both private subnets).
+      SubnetIds:
+        - Fn::ImportValue: !Sub '${NetworkStackName}-PrivateSubnet1'
+        - Fn::ImportValue: !Sub '${NetworkStackName}-PrivateSubnet2'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-cafe-subnets'
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    # Gate RDS provisioning on the ASG passing its launch check. The Multi-AZ RDS
+    # takes 10-15 min; if the ASG failed afterward, the DeletionPolicy: Snapshot on
+    # a not-yet-available DB would block rollback. Depending on the ASG means the
+    # slow DB only starts once instances launch successfully.
+    DependsOn: AutoScalingGroup
+    Metadata:
+      cfn-lint:
+        config:
+          # W1011 suppressed deliberately. cfn-lint prefers a dynamic reference
+          # (Secrets Manager) for DB passwords. The prior build's security design
+          # is the opposite on purpose: the RDS MASTER credential is NEVER stored
+          # in Secrets Manager. It is supplied transiently at deploy time (NoEcho
+          # parameter), used only to seed the schema and create the DML-only app
+          # user, then discarded. Only the seven /cafe/* APP secrets live in
+          # Secrets Manager, read by the instance role. Using a dynamic reference
+          # here would force the master secret to be persisted, which this design
+          # explicitly avoids.
+          ignore_checks:
+            - W1011
+    # Snapshot on delete so the graded data is not silently lost; cleanup checks
+    # for the retained snapshot (per the assignment teardown note).
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub '${AWS::StackName}-cafe-rds'
+      Engine: mariadb                       # prior build: MariaDB 11.8.x
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: !Ref DBAllocatedStorage
+      StorageType: gp2
+      MultiAZ: true                         # requirement: Multi-AZ
+      PubliclyAccessible: false             # requirement: DB stays private
+      BackupRetentionPeriod: 1
+      MasterUsername: !Ref DBMasterUsername
+      MasterUserPassword: !Ref DBMasterPassword
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref RdsSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-cafe-rds'
+
+######################
+# Outputs section
+######################
+
+Outputs:
+
+  CafeMenuURL:
+    Description: Real cafe menu URL (verify this shows the populated 9-item menu, not just a 200).
+    Value: !Sub 'http://${LoadBalancer.DNSName}/cafe/menu.php'
+
+  LoadBalancerDNS:
+    Description: Public DNS name of the ALB.
+    Value: !GetAtt LoadBalancer.DNSName
+
+  BastionPublicIp:
+    Description: Bastion public IP for SSH from the workstation (ssh ec2-user@<ip>).
+    Value: !GetAtt BastionInstance.PublicIp
+
+  RdsEndpointAddress:
+    Description: Private RDS endpoint (reachable only from the app SG and the seed bastion).
+    Value: !GetAtt Database.Endpoint.Address
+
+  AutoScalingGroupName:
+    Description: Auto Scaling group name (check live Min/Max/Desired here).
+    Value: !Ref AutoScalingGroup

@@ -1,0 +1,290 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  Network Template (SEIS615 cafe): Multi-AZ VPC with public and private subnets,
+  an internet gateway, one NAT gateway per AZ, and exports consumed by the
+  application stack. Rebuilt from the prior Elasticity & Availability deployment
+  (us-east-2a/2b) so the scalable cafe can be recreated with CloudFormation.
+
+# CHANGED FROM CLASS ORIGINAL (baseline/lab-network.yaml.orig):
+#   The class original created a SINGLE public subnet and exported only
+#   ${StackName}-SubnetID and ${StackName}-VPCID. The cafe needs a highly
+#   available, multi-tier layout, so this template now creates:
+#     VPC (10.0.0.0/16)                           <- unchanged CIDR
+#     Internet Gateway + public route table        <- unchanged intent
+#     2 PUBLIC subnets  (ALB + bastion live here)  <- was 1 public subnet
+#     2 PRIVATE subnets (app + RDS live here)      <- NEW (demo had none)
+#     1 NAT gateway PER AZ for private egress       <- NEW (demo had none)
+#   The two original exports are preserved for backward compatibility; new
+#   exports are added so the application stack can place the ALB, Auto Scaling
+#   group, and Multi-AZ RDS across both AZs without circular dependencies.
+#
+# Source of settings: prior Elasticity HANDOFF.md + deploy-stage1-network.sh +
+# evidence/verify/12-verification.txt (VPC 10.0.0.0/16; public 10.0.0.0/24 in
+# us-east-2a and 10.0.1.0/24 in us-east-2b; private 10.0.2.0/23 in us-east-2a and
+# 10.0.4.0/23 in us-east-2b; IGW; one NAT gateway per AZ).
+
+######################
+# Parameters section
+######################
+
+Parameters:
+
+  # NEW: lets the deployer pin the two AZs instead of relying only on !GetAZs
+  # ordering. Defaults match the prior build (us-east-2a / us-east-2b). The
+  # subnet-to-AZ mapping below is explicit so the private subnet in AZ1 shares an
+  # AZ with its zonal NAT gateway (requirement: map subnets to the right AZs).
+  AvailabilityZone1:
+    Description: First Availability Zone (public-a + private-a). Must be in the deployment Region.
+    Type: AWS::EC2::AvailabilityZone::Name
+    Default: us-east-2a
+
+  AvailabilityZone2:
+    Description: Second Availability Zone (public-b + private-b). Must differ from AZ1.
+    Type: AWS::EC2::AvailabilityZone::Name
+    Default: us-east-2b
+
+######################
+# Resources section
+######################
+
+Resources:
+
+  ## VPC (unchanged CIDR 10.0.0.0/16; DNS support/hostnames kept on so instances
+  ## and the RDS endpoint resolve inside the VPC).
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      CidrBlock: 10.0.0.0/16
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-vpc'
+
+  ## Internet Gateway (unchanged) — provides public egress for the ALB and bastion.
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-igw'
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  ## Public Route Table (unchanged intent) — default route to the IGW. Shared by
+  ## both public subnets, matching the prior build (one public route table).
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-rt-public'
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  ## PUBLIC SUBNET A (10.0.0.0/24, AZ1) — was the single "PublicSubnet" in the
+  ## original. MapPublicIpOnLaunch kept true so the bastion gets a public IP.
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.0.0/24
+      AvailabilityZone: !Ref AvailabilityZone1
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-a'
+
+  ## PUBLIC SUBNET B (10.0.1.0/24, AZ2) — NEW. Second public subnet so the ALB
+  ## (which requires >=2 AZs) and a standby bastion AZ are available.
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Ref AvailabilityZone2
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-b'
+
+  ## PRIVATE SUBNET A (10.0.2.0/23, AZ1) — NEW. Hosts app instances + RDS; no
+  ## public IPs. /23 matches the prior build's larger private ranges.
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/23
+      AvailabilityZone: !Ref AvailabilityZone1
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-a'
+
+  ## PRIVATE SUBNET B (10.0.4.0/23, AZ2) — NEW. Second private subnet so the ASG
+  ## and the Multi-AZ RDS subnet group span two AZs.
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.4.0/23
+      AvailabilityZone: !Ref AvailabilityZone2
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-b'
+
+  ## Public subnet route-table associations (both public subnets -> IGW route table).
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  ## NAT gateways — NEW. One per AZ so a single AZ failure does not take down
+  ## private egress for the other AZ. Each needs an Elastic IP.
+  NatEIP1:
+    Type: AWS::EC2::EIP
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-nat-a-eip'
+
+  NatEIP2:
+    Type: AWS::EC2::EIP
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-nat-b-eip'
+
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEIP1.AllocationId
+      SubnetId: !Ref PublicSubnet1   # zonal NAT lives in the public subnet of AZ1
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-nat-a'
+
+  NatGateway2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEIP2.AllocationId
+      SubnetId: !Ref PublicSubnet2   # zonal NAT lives in the public subnet of AZ2
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-nat-b'
+
+  ## Private route tables — NEW. One per AZ, each default-routing to that AZ's NAT
+  ## gateway so instances can fetch the cafe app/SDK and reach Secrets Manager/SSM.
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-rt-private-a'
+
+  PrivateRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable1
+
+  PrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-rt-private-b'
+
+  PrivateRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway2
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable2
+
+######################
+# Outputs section
+######################
+# The application stack imports these with Fn::ImportValue using NetworkStackName.
+# Export NAMES are the stack contract; keep them stable. The two original export
+# names are preserved; PublicSubnet1 doubles as the legacy "-SubnetID".
+
+Outputs:
+
+  # PRESERVED CONTRACT: original export name ${StackName}-SubnetID. Points at the
+  # first public subnet so any consumer of the old name still resolves.
+  PublicSubnet1:
+    Description: Public subnet in AZ1 (ALB + bastion). Also the legacy -SubnetID export.
+    Value: !Ref PublicSubnet1
+    Export:
+      Name: !Sub '${AWS::StackName}-SubnetID'
+
+  # PRESERVED CONTRACT: original export name ${StackName}-VPCID.
+  VPC:
+    Description: VPC ID
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VPCID'
+
+  # NEW exports consumed by the application stack.
+  PublicSubnet1Id:
+    Description: Public subnet AZ1
+    Value: !Ref PublicSubnet1
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnet1'
+
+  PublicSubnet2Id:
+    Description: Public subnet AZ2
+    Value: !Ref PublicSubnet2
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnet2'
+
+  PrivateSubnet1Id:
+    Description: Private subnet AZ1 (app + RDS)
+    Value: !Ref PrivateSubnet1
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnet1'
+
+  PrivateSubnet2Id:
+    Description: Private subnet AZ2 (app + RDS)
+    Value: !Ref PrivateSubnet2
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnet2'
